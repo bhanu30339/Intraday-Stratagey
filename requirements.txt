@@ -10,3 +10,4 @@ pytz
 numpy
 streamlit-autorefresh
 logzero
+websocket-client
