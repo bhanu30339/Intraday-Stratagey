@@ -1,4 +1,12 @@
-streamlit
-yfinance
-pandas
+
 matplotlib
+streamlit
+pyotp
+pandas
+plotly
+SmartApi
+yfinance
+ta
+pytz
+numpy
+streamlit-autorefresh
