@@ -4,7 +4,7 @@ streamlit
 pyotp
 pandas
 plotly
-SmartApi
+smartapi-python
 yfinance
 ta
 pytz
