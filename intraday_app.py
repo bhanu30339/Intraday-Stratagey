@@ -200,7 +200,6 @@ import ta
 import pytz
 from streamlit_autorefresh import st_autorefresh
 
-
 # ------------------------
 # Initialize states if not present
 # ------------------------
@@ -210,13 +209,11 @@ if "last_trade" not in st.session_state:
 if "square_off_done" not in st.session_state:
     st.session_state["square_off_done"] = False
 
-
 # ------------------------
 # Constants for Square-off
 # ------------------------
 SQUARE_OFF_TIME = datetime.time(hour=15, minute=15)  # 3:15 PM IST
 IST = pytz.timezone("Asia/Kolkata")
-
 
 # ------------------------
 # Load secrets
@@ -226,7 +223,6 @@ ANGEL_API_KEY = st.secrets["ANGEL_API_KEY"]
 ANGEL_CLIENT_CODE = st.secrets["ANGEL_CLIENT_CODE"]
 ANGEL_PASSWORD = st.secrets["ANGEL_PASSWORD"]
 ANGEL_TOTP_SECRET = st.secrets["ANGEL_TOTP_SECRET"]
-
 
 # ------------------------
 # Login Function
@@ -240,13 +236,12 @@ def angel_login():
     st.success("✅ Connected to Angel One SmartAPI")
     return obj
 
-
 smart_api = angel_login()
 
-
 # ------------------------
-# Symbol Lookup
+# Symbol Lookup with Caching
 # ------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_symbol_details(symbol: str):
     try:
         data = smart_api.searchScrip("NSE", symbol.upper())
@@ -260,9 +255,8 @@ def get_symbol_details(symbol: str):
         st.error(f"Error fetching symbol details: {e}")
         return None, None
 
-
 # ------------------------
-# Get Live Price
+# Get Live Price (not cached for intraday trading)
 # ------------------------
 def get_ltp(symbol):
     token, tradingsymbol = get_symbol_details(symbol)
@@ -275,7 +269,6 @@ def get_ltp(symbol):
         st.error(f"Error fetching price: {e}")
         return None
 
-
 # ------------------------
 # Calculate quantity based on capital, risk %, stoploss %, and LTP
 # ------------------------
@@ -286,7 +279,6 @@ def calculate_qty(capital, risk_pct, stoploss_pct, ltp):
     risk_per_share = ltp * (stoploss_pct / 100)
     qty = int(risk_amount / risk_per_share)
     return max(qty, 1)  # minimum 1 share
-
 
 # ------------------------
 # Place Orders
@@ -325,7 +317,6 @@ def place_order(transaction_type, qty, stoploss_pct, target_pct):
     except Exception as e:
         st.error(f"❌ Order failed: {e}")
 
-
 # ------------------------
 # Safe float conversion helper
 # ------------------------
@@ -341,13 +332,31 @@ def safe_float(val):
     except (TypeError, ValueError):
         return None
 
+# ------------------------
+# Caching positions and order book for 1 minute
+# ------------------------
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_positions():
+    try:
+        return smart_api.position()
+    except Exception as e:
+        st.error(f"API rate-limit or error fetching positions: {e}")
+        return None
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_order_book():
+    try:
+        return smart_api.orderBook()
+    except Exception as e:
+        st.error(f"API rate-limit or error fetching orders: {e}")
+        return None
 
 # ------------------------
 # Auto square-off function
 # ------------------------
 def auto_square_off():
-    positions_response = smart_api.position()
-    if "data" in positions_response and positions_response["data"]:
+    positions_response = cached_positions()
+    if positions_response and "data" in positions_response and positions_response["data"]:
         df_pos = pd.DataFrame(positions_response["data"])
         df_pos = df_pos[df_pos["netqty"].astype(float) != 0]
         if df_pos.empty:
@@ -362,17 +371,14 @@ def auto_square_off():
     else:
         st.info("No positions found for auto square-off.")
 
-
 # ------------------------
 # Streamlit UI Setup
 # ------------------------
 st.title("📊 Intraday Trading App")
 
-
 stock = st.text_input("Enter Stock Symbol (NSE)", "ICICIBANK")
 stoploss_pct = st.number_input("Stoploss %", min_value=0.1, max_value=20.0, value=1.0, step=0.1)
 target_pct = st.number_input("Target %", min_value=0.1, max_value=50.0, value=2.0, step=0.1)
-
 capital = st.number_input("Available Capital (₹)", min_value=1000, value=10000, step=500)
 risk_pct = st.number_input("Risk % per Trade", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
 
@@ -397,8 +403,8 @@ with col2:
 st.subheader("🤖 Strategy Automation")
 auto_trade = st.toggle("Enable Auto-Trade (SMA + RSI)")
 
-# Auto refresh every 60 seconds
-st_autorefresh(interval=60 * 1000, limit=None, key="refresh")
+# Auto refresh every 180 seconds (3min) - reduce rate to help rate-limiting
+st_autorefresh(interval=180 * 1000, limit=None, key="refresh")
 
 # Check current IST time for square-off
 now = datetime.datetime.now(IST).time()
@@ -414,19 +420,15 @@ if auto_trade:
 end = datetime.datetime.now()
 start = end - datetime.timedelta(days=5)
 data = yf.download(f"{stock}.NS", start=start, end=end, interval="5m")
-
 if not data.empty:
     data["SMA20"] = data["Close"].rolling(20).mean()
     data["SMA50"] = data["Close"].rolling(50).mean()
     close_series = data["Close"].squeeze()
     data["RSI"] = ta.momentum.RSIIndicator(close_series, window=14).rsi()
-
     latest = data.iloc[-1]
     sma20 = safe_float(latest["SMA20"])
     sma50 = safe_float(latest["SMA50"])
     rsi = safe_float(latest["RSI"])
-
-    # Plot Candlestick + SMAs
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
         x=data.index,
@@ -439,78 +441,57 @@ if not data.empty:
     fig.add_trace(go.Scatter(x=data.index, y=data["SMA20"], line=dict(color="blue"), name="SMA20"))
     fig.add_trace(go.Scatter(x=data.index, y=data["SMA50"], line=dict(color="red"), name="SMA50"))
     st.plotly_chart(fig)
-
-    # RSI Line Chart
     st.line_chart(data["RSI"], height=200)
-
-    # Auto-Trade logic with duplicate prevention
     if auto_trade and sma20 is not None and sma50 is not None and rsi is not None:
         prev_sma20 = safe_float(data.iloc[-2]["SMA20"])
         prev_sma50 = safe_float(data.iloc[-2]["SMA50"])
         if prev_sma20 is not None and prev_sma50 is not None:
-            if prev_sma20 < prev_sma50 and sma20 > sma50:
-                if st.session_state["last_trade"] != "BUY":
-                    st.info("SMA20 crossed above SMA50 → BUY Signal Triggered")
-                    place_order("BUY", qty, stoploss_pct, target_pct)
-                    st.session_state["last_trade"] = "BUY"
-                else:
-                    st.info("BUY signal active, no new order placed.")
-            elif prev_sma20 > prev_sma50 and sma20 < sma50:
-                if st.session_state["last_trade"] != "SELL":
-                    st.info("SMA20 crossed below SMA50 → SELL Signal Triggered")
-                    place_order("SELL", qty, stoploss_pct, target_pct)
-                    st.session_state["last_trade"] = "SELL"
-                else:
-                    st.info("SELL signal active, no new order placed.")
+            if prev_sma20 < prev_sma50 and sma20 > sma50 and st.session_state["last_trade"] != "BUY":
+                st.info("SMA20 crossed above SMA50 → BUY Signal Triggered")
+                place_order("BUY", qty, stoploss_pct, target_pct)
+                st.session_state["last_trade"] = "BUY"
+            elif prev_sma20 > prev_sma50 and sma20 < sma50 and st.session_state["last_trade"] != "SELL":
+                st.info("SMA20 crossed below SMA50 → SELL Signal Triggered")
+                place_order("SELL", qty, stoploss_pct, target_pct)
+                st.session_state["last_trade"] = "SELL"
+            else:
+                st.info("Signal active, no new order placed.")
 else:
     st.warning("No chart data available for this stock.")
 
 # Display Orders
 st.subheader("📒 Order Book")
-try:
-    orders = smart_api.orderBook()
-    if "data" in orders and orders["data"]:
-        st.dataframe(pd.DataFrame(orders["data"]))
-    else:
-        st.info("No orders found.")
-except Exception as e:
-    st.error(f"Error fetching order book: {e}")
+orders = cached_order_book()
+if orders and "data" in orders and orders["data"]:
+    st.dataframe(pd.DataFrame(orders["data"]))
+else:
+    st.info("No orders found or API rate-limit reached.")
 
 # Display Open Positions
 st.subheader("📌 Open Positions")
-try:
-    positions = smart_api.position()
-    if "data" in positions and positions["data"]:
-        st.dataframe(pd.DataFrame(positions["data"]))
-    else:
-        st.info("No positions found.")
-except Exception as e:
-    st.error(f"Error fetching positions: {e}")
+positions = cached_positions()
+if positions and "data" in positions and positions["data"]:
+    st.dataframe(pd.DataFrame(positions["data"]))
+else:
+    st.info("No positions found or API rate-limit reached.")
 
 # Manual Position Exit Section
 st.subheader("🛑 Manual Position Exit")
-try:
-    positions_response = smart_api.position()
-    if "data" in positions_response and positions_response["data"]:
-        df_pos = pd.DataFrame(positions_response["data"])
-
-        df_pos = df_pos[df_pos["netqty"].astype(float) != 0]
-
-        if not df_pos.empty:
-            for idx, row in df_pos.iterrows():
-                symbol = row["tradingsymbol"]
-                qty = abs(int(float(row["netqty"])))
-                side = "SELL" if float(row["netqty"]) > 0 else "BUY"
-                st.write(f"Position: {symbol}, Qty: {qty}, Side: {side}")
-
-                if st.button(f"Exit {symbol}", key=f"exit_{idx}"):
-                    st.info(f"Exiting position for {symbol}...")
-                    place_order(side, qty, stoploss_pct, target_pct)
-                    st.success(f"Exit order placed for {symbol}")
-        else:
-            st.info("No open positions to exit.")
+positions_response = cached_positions()
+if positions_response and "data" in positions_response and positions_response["data"]:
+    df_pos = pd.DataFrame(positions_response["data"])
+    df_pos = df_pos[df_pos["netqty"].astype(float) != 0]
+    if not df_pos.empty:
+        for idx, row in df_pos.iterrows():
+            symbol = row["tradingsymbol"]
+            qty = abs(int(float(row["netqty"])))
+            side = "SELL" if float(row["netqty"]) > 0 else "BUY"
+            st.write(f"Position: {symbol}, Qty: {qty}, Side: {side}")
+            if st.button(f"Exit {symbol}", key=f"exit_{idx}"):
+                st.info(f"Exiting position for {symbol}...")
+                place_order(side, qty, stoploss_pct, target_pct)
+                st.success(f"Exit order placed for {symbol}")
     else:
-        st.info("No positions found.")
-except Exception as e:
-    st.error(f"Error fetching positions: {e}")
-
+        st.info("No open positions to exit.")
+else:
+    st.info("No positions found or API rate-limit reached.")
